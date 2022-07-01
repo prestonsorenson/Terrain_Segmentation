@@ -1,0 +1,145 @@
+#load library
+library(RSAGA)
+library(raster)
+library(dplyr)
+library(rgdal)
+
+T=1000
+t_val=100
+focal_area=25
+
+#set work directory
+project_name='project'
+directory="/home/preston/OneDrive/Papers/Terrain_Analysis/Data/DEM/"
+dem='input_dem.tif'
+
+setwd(directory)
+
+dem.raster=raster(dem)
+
+#create directories for specific output file types
+dir.create("Terrain")
+
+dem.filepath <- paste(directory, dem, sep='/')
+
+output.directory <-  paste(directory, 'Terrain/', sep='/')
+
+dem.sgrd.filepath <- paste0(output.directory,"dem.sgrd")
+
+
+res.vector <- res(dem.raster)
+res <- res.vector[1]
+
+
+
+
+#########IMPORT DEM to .sgrd##########3
+
+rsaga.geoprocessor("io_gdal", module = 0,
+                   param = list(
+                     FILES= dem.filepath,
+                     GRIDS= dem.sgrd.filepath,
+                     RESAMPLING= 0 ))
+
+
+#########Slope, aspect, curvature########################
+
+#Use Slope, Aspect, Curvature tool from SAGA on dem
+rsaga.slope.asp.curv(in.dem=dem.filepath, 
+                     out.slope =  "Terrain/slope.sgrd", 
+                     out.aspect= "Terrain/aspect.sgrd",
+                     out.cgene =  "Terrain/gen_curve.sgrd",
+                     out.cprof =   "Terrain/prof.sgrd", 
+                     out.cplan =  "Terrain/plan.sgrd", 
+                     out.ctang = "Terrain/tang_curve.sgrd",
+                     method = "poly2zevenbergen")
+
+
+
+############# Relative Heights and Slope Positions######################
+rsaga.geoprocessor("ta_morphometry", module = 14,
+                   param = list(
+                     DEM=dem.sgrd.filepath,
+                     HO= "Terrain/Slope_Height.sgrd",
+                     HU= "Terrain/Valley_Depth.sgrd",
+                     NH= "Terrain/Norm_Height.sgrd",
+                     SH= "Terrain/Stand_Height.sgrd",
+                     MS= "Terrain/MidSlope_Pos.sgrd",
+                     W=0.5,
+                     T=t_val,
+                     E=2
+                    ))
+
+##################Landcape Mapping#####################################
+setwd(output.directory)
+
+norm_height=readAll(raster('Norm_Height.sdat'))
+prof=readAll(raster('prof.sdat'))
+
+#focal 25 m focal size
+focal_size=ceiling(focal_area/res(norm_height)[1])
+focal_size=ifelse(focal_size%%2==0, focal_size+1, focal_size)
+focal_size=ifelse(focal_size<3, 3, focal_size)
+
+#focal filter for sd values
+nh_sd=focal(norm_height, w=matrix(1, focal_size,focal_size), fun=sd, pad=TRUE)
+
+norm_height=rasterToPoints(norm_height)
+prof=rasterToPoints(prof)
+nh_sd=rasterToPoints(nh_sd)
+
+xy=norm_height[,1:2]
+norm_height=norm_height[,-c(1:2)]
+nh_sd=nh_sd[,-c(1:2)]
+prof=prof[,-c(1:2)]
+
+#Pennock 1987 sets concave at <-0.10 degrees per m which is -0.00174533 /m (curvature units for SAGA are in 1/m = 1 radian/m)
+
+#determine landscape slope class
+depression=1-pnorm(norm_height, 0.1, nh_sd)
+low=1-pnorm(norm_height, 0.3, nh_sd)
+upper=pnorm(norm_height, 0.7, nh_sd)
+mid=1-(low+upper)
+
+depression_right=pnorm(norm_height, 0.3, nh_sd)
+low=1-(depression+depression_right)
+
+crest=pnorm(norm_height, 0.9, nh_sd)
+crest_left=1-pnorm(norm_height, 0.7, nh_sd)
+upper=1-(crest+crest_left)
+
+#determine slope positions
+prob_land=data.frame(depression, low, mid, upper, crest)
+
+land=apply(prob_land, 1, function(x) names(x)[which.max(x)])
+curve=ifelse(prof<(-0.00174533), 'concave', ifelse(prof>0.00174533, 'convex', 'flat'))
+
+
+table(land)/sum(table(land))
+table(curve)/sum(table(curve))
+
+landscape=paste(land, curve, sep='_')
+(table(landscape)/sum(table(landscape)))*100
+
+land_classes=c('depression_concave', 'depression_flat', 'depression_convex',
+               'low_concave', 'low_flat', 'low_convex',
+               'mid_concave', 'mid_flat', 'mid_convex',
+               'upper_concave', 'upper_flat', 'upper_convex',
+               'crest_concave', 'crest_flat', 'crest_convex')
+land_classes=data.frame(land_classes, seq(1,15,1))
+colnames(land_classes)=c('landscape', 'code')
+
+landscape=data.frame(landscape, xy)
+
+landscape=merge(land_classes, landscape, by='landscape')
+
+landscape=landscape[,-1]
+
+coordinates(landscape)=~x+y
+landscape=rasterFromXYZ(landscape)
+plot(landscape)
+
+Sys.Date()
+
+#export landscape classes
+writeRaster(landscape, paste(project_name, "landscape_position", Sys.Date(), sep="_"), format='GTiff', overwrite=TRUE)
